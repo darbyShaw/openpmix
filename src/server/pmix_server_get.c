@@ -84,6 +84,7 @@ PMIX_CLASS_INSTANCE(pmix_dmdx_reply_caddy_t, pmix_object_t, dcd_con, NULL);
 static void dmdx_cbfunc(pmix_status_t status, const char *data, size_t ndata, void *cbdata,
                         pmix_release_cbfunc_t relfn, void *relcbdata);
 static pmix_status_t _satisfy_request(pmix_namespace_t *nptr, pmix_rank_t rank,
+                                      char *req_nptr, pmix_rank_t req_rank,
                                       pmix_server_caddy_t *cd, bool diffnspace, pmix_scope_t scope,
                                       pmix_modex_cbfunc_t cbfunc, void *cbdata);
 static pmix_status_t create_local_tracker(char nspace[], pmix_rank_t rank, pmix_info_t info[],
@@ -146,9 +147,9 @@ pmix_status_t pmix_server_get(pmix_buffer_t *buf, pmix_modex_cbfunc_t cbfunc, vo
     pmix_server_caddy_t *cd = (pmix_server_caddy_t *) cbdata;
     int32_t cnt;
     pmix_status_t rc;
-    pmix_rank_t rank;
+    pmix_rank_t rank, req_rank;
     char *cptr, *key = NULL;
-    char nspace[PMIX_MAX_NSLEN + 1];
+    char nspace[PMIX_MAX_NSLEN + 1], req_nspace[PMIX_MAX_NSLEN + 1];
     pmix_namespace_t *ns, *nptr;
     pmix_dmdx_local_t *lcd;
     bool local = false;
@@ -166,6 +167,7 @@ pmix_status_t pmix_server_get(pmix_buffer_t *buf, pmix_modex_cbfunc_t cbfunc, vo
     pmix_info_t *info;
     pmix_scope_t scope = PMIX_SCOPE_UNDEF;
     pmix_rank_info_t *iptr;
+    pmix_group_t *grp;
 
     pmix_output_verbose(2, pmix_server_globals.get_output,
                         "%s recvd GET",
@@ -182,6 +184,7 @@ pmix_status_t pmix_server_get(pmix_buffer_t *buf, pmix_modex_cbfunc_t cbfunc, vo
         return rc;
     }
     PMIX_LOAD_NSPACE(nspace, cptr);
+    PMIX_LOAD_NSPACE(req_nspace, cptr);
     free(cptr);
     cnt = 1;
     PMIX_BFROPS_UNPACK(rc, cd->peer, buf, &rank, &cnt, PMIX_PROC_RANK);
@@ -189,6 +192,7 @@ pmix_status_t pmix_server_get(pmix_buffer_t *buf, pmix_modex_cbfunc_t cbfunc, vo
         PMIX_ERROR_LOG(rc);
         return rc;
     }
+    req_rank = rank;
     /* retrieve any provided info structs */
     cnt = 1;
     PMIX_BFROPS_UNPACK(rc, cd->peer, buf, &cd->ninfo, &cnt, PMIX_SIZE);
@@ -237,6 +241,24 @@ pmix_status_t pmix_server_get(pmix_buffer_t *buf, pmix_modex_cbfunc_t cbfunc, vo
     }
 
     /* find the nspace object for the target proc */
+    /*If it is a group, replace namespace and rank appropriately*/
+    PMIX_LIST_FOREACH (grp, &pmix_server_globals.groups, pmix_group_t) {
+        if (0 == strcmp(nspace, grp->grpid)) {
+           /* At the moment support only process realm queries 
+            * for group members
+            * */
+            if (rank != PMIX_RANK_WILDCARD && rank < grp->nmbrs)
+            {
+                PMIX_LOAD_NSPACE(nspace, grp->members[rank].nspace);
+                rank = grp->members[rank].rank;
+                /* Do not break here since this might also be a group.
+                * Keep searching for the group.*/
+                grp = (pmix_group_t *) pmix_list_get_begin(&pmix_server_globals.groups);
+                scope = PMIX_SCOPE_UNDEF;
+                scope_given = true; 
+            }
+        }
+    }
     nptr = NULL;
     PMIX_LIST_FOREACH (ns, &pmix_globals.nspaces, pmix_namespace_t) {
         if (0 == strcmp(nspace, ns->nspace)) {
@@ -244,6 +266,11 @@ pmix_status_t pmix_server_get(pmix_buffer_t *buf, pmix_modex_cbfunc_t cbfunc, vo
             break;
         }
     }
+    
+    pmix_output_verbose(2, pmix_server_globals.get_output,
+                        "%s EXECUTE GET FOR %s:%d WITH KEY %s ON BEHALF OF %s",
+                        PMIX_NAME_PRINT(&pmix_globals.myid), req_nspace, req_rank,
+                        (NULL == key) ? "NULL" : key, PMIX_PNAME_PRINT(&cd->peer->info->pname));
 
     pmix_output_verbose(2, pmix_server_globals.get_output,
                         "%s EXECUTE GET FOR %s:%d WITH KEY %s ON BEHALF OF %s",
@@ -337,6 +364,8 @@ pmix_status_t pmix_server_get(pmix_buffer_t *buf, pmix_modex_cbfunc_t cbfunc, vo
         /* if all the procs are local, then this must be a local proc */
         if (nptr->nprocs == nptr->nlocalprocs) {
             local = true;
+            pmix_output_verbose(2, pmix_server_globals.get_output, "%s:%d This is a local proc request",
+                        pmix_globals.myid.nspace, pmix_globals.myid.rank);
         } else {
             /* see if this proc is one of our local ones */
             PMIX_LIST_FOREACH (iptr, &nptr->ranks, pmix_rank_info_t) {
@@ -396,12 +425,21 @@ pmix_status_t pmix_server_get(pmix_buffer_t *buf, pmix_modex_cbfunc_t cbfunc, vo
         cb.info = cd->info;
         cb.ninfo = cd->ninfo;
         cb.key = key;
+        pmix_output_verbose(2, pmix_server_globals.get_output, "%s:%d Checking GDS",
+                        pmix_globals.myid.nspace, pmix_globals.myid.rank);
         PMIX_GDS_FETCH_KV(rc, pmix_globals.mypeer, &cb);
         /* if the requested key was found, but in a different scope,
          * then we report this back as there is no point in waiting */
         if (PMIX_ERR_EXISTS_OUTSIDE_SCOPE == rc) {
+            pmix_output_verbose(2, pmix_server_globals.get_output, "%s:%d Outside scope in GDS",
+                        pmix_globals.myid.nspace, pmix_globals.myid.rank);
             PMIX_DESTRUCT(&cb);
             return PMIX_ERR_NOT_FOUND;
+        }
+        if (rc == PMIX_SUCCESS)
+        {
+            pmix_output_verbose(2, pmix_server_globals.get_output, "%s:%d Found key in GDS",
+                        pmix_globals.myid.nspace, pmix_globals.myid.rank);
         }
         /* A local client may send a get request concurrently with
          * a commit request from another client, but the server may
@@ -417,6 +455,8 @@ pmix_status_t pmix_server_get(pmix_buffer_t *buf, pmix_modex_cbfunc_t cbfunc, vo
         if ((PMIX_SUCCESS != rc) && local) {
             PMIX_GDS_FETCH_KV(rc, cd->peer, &cb);
             if (PMIX_SUCCESS == rc) {
+                pmix_output_verbose(2, pmix_server_globals.get_output, "%s:%d Found key in peer GDS",
+                        pmix_globals.myid.nspace, pmix_globals.myid.rank);
                 cbfunc(rc, NULL, 0, cbdata, NULL, NULL);
                 PMIX_DESTRUCT(&cb);
                 return rc;
@@ -426,6 +466,8 @@ pmix_status_t pmix_server_get(pmix_buffer_t *buf, pmix_modex_cbfunc_t cbfunc, vo
         /* if the requested key was found, but in a different scope,
          * then we report this back as there is no point in waiting */
         if (PMIX_ERR_EXISTS_OUTSIDE_SCOPE == rc) {
+            pmix_output_verbose(2, pmix_server_globals.get_output, "%s:%d Outside scope in peer GDS",
+                        pmix_globals.myid.nspace, pmix_globals.myid.rank);
             return PMIX_ERR_NOT_FOUND;
         }
         if (PMIX_SUCCESS != rc) {
@@ -480,7 +522,7 @@ pmix_status_t pmix_server_get(pmix_buffer_t *buf, pmix_modex_cbfunc_t cbfunc, vo
     }
 
     /* since everyone has registered, see if we already have this data */
-    rc = _satisfy_request(nptr, rank, cd, diffnspace, scope, cbfunc, cbdata);
+    rc = _satisfy_request(nptr, rank, req_nspace, req_rank, cd, diffnspace, scope, cbfunc, cbdata);
     if (PMIX_SUCCESS == rc) {
         /* return success as the satisfy_request function
          * calls the cbfunc for us, and it will have
@@ -735,6 +777,7 @@ static pmix_status_t get_job_data(char *nspace,
 }
 
 static pmix_status_t _satisfy_request(pmix_namespace_t *nptr, pmix_rank_t rank,
+                                      char *req_nptr, pmix_rank_t req_rank,
                                       pmix_server_caddy_t *cd, bool diffnspace, pmix_scope_t scope,
                                       pmix_modex_cbfunc_t cbfunc, void *cbdata)
 {
@@ -799,6 +842,13 @@ static pmix_status_t _satisfy_request(pmix_namespace_t *nptr, pmix_rank_t rank,
     if (PMIX_SUCCESS == rc) {
         found = true;
         PMIX_CONSTRUCT(&pkt, pmix_buffer_t);
+        /*For PMIx groups the group proc requesting data 
+         * is mapped to actual nspace proc.*/
+        if (strcmp(nptr->nspace, req_nptr))
+        {
+            strcpy(proc.nspace, req_nptr);
+            proc.rank = req_rank;
+        }
         /* assemble the provided data into a byte object */
         if (PMIX_RANK_UNDEF == rank || diffnspace) {
             PMIX_GDS_ASSEMB_KVS_REQ(rc, pmix_globals.mypeer, &proc, &cb.kvs, &pkt, cd);
@@ -922,7 +972,7 @@ pmix_status_t pmix_pending_resolve(pmix_namespace_t *nptr,
         PMIX_LIST_FOREACH (req, &ptr->loc_reqs, pmix_dmdx_request_t) {
             pmix_status_t rc;
             bool diffnspace = !PMIX_CHECK_NSPACE(nptr->nspace, req->lcd->proc.nspace);
-            rc = _satisfy_request(nptr, rank, &scd, diffnspace, scope,
+            rc = _satisfy_request(nptr, rank, nptr->nspace, rank, &scd, diffnspace, scope,
                                   req->cbfunc, req->cbdata);
             if (PMIX_SUCCESS != rc) {
                 /* if we can't satisfy this particular request (missing key?) */

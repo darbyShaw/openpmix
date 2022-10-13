@@ -757,8 +757,13 @@ static void get_data(int sd, short args, void *cbdata)
                             }
                         } else {
                             /* could not find hostname or nodeid, so we cannot do anything */
-                            cb->status = PMIX_ERR_NOT_FOUND;
-                            goto done;
+                            //cb->status = PMIX_ERR_NOT_FOUND;
+                            nfo = cb->ninfo;
+                            PMIX_INFO_CREATE(iptr, nfo);
+                            for (n=0; n < cb->ninfo; n++) {
+                                PMIX_INFO_XFER(&iptr[n], &cb->info[n]);
+                            }
+                            goto doget;
                         }
                     }
                 }
@@ -1008,7 +1013,7 @@ doget:
         if (PMIX_PEER_IS_EARLIER(pmix_client_globals.myserver, 3, 1, 100) ||
             !PMIX_CHECK_NSPACE(lg->p.nspace, pmix_globals.myid.nspace)) {
             /* flag that we want all of the job-level info */
-            proc.rank = PMIX_RANK_WILDCARD;
+            //proc.rank = PMIX_RANK_WILDCARD;
         } else if (NULL != cb->key) {
             /* this is a reserved key - we should have had this info, but
              * it is possible that some system don't provide it, thereby

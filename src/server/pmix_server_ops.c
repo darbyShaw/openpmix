@@ -429,6 +429,9 @@ static pmix_server_trkr_t *new_tracker(char *id, pmix_proc_t *procs,
     pmix_rank_info_t *info;
     pmix_nspace_caddy_t *nm;
     pmix_nspace_t first;
+    pmix_group_t *grp;
+    char grp_nspace_map[PMIX_MAX_NSLEN + 1];
+    pmix_rank_t grp_rank_map;
 
     pmix_output_verbose(5, pmix_server_globals.fence_output,
                         "new_tracker called with %d procs",
@@ -473,16 +476,36 @@ static pmix_server_trkr_t *new_tracker(char *id, pmix_proc_t *procs,
     for (i = 0; i < nprocs; i++) {
         /* is this nspace known to us? */
         nptr = NULL;
+        PMIX_LOAD_NSPACE(grp_nspace_map, procs[i].nspace);
+        grp_rank_map = procs[i].rank;
+        pmix_output_verbose(5, pmix_server_globals.fence_output,
+                                    "searching for %s.%d", grp_nspace_map,
+                                    grp_rank_map);
+        /* Check the groups first. In groups we assume we never
+         * do a wildcard entry. We always list them individually.*/
+        PMIX_LIST_FOREACH (grp, &pmix_server_globals.groups, pmix_group_t) {
+            if (0 == strcmp (grp_nspace_map, grp->grpid)) {
+                PMIX_LOAD_NSPACE(grp_nspace_map, grp->members[grp_rank_map].nspace);
+                grp_rank_map = grp->members[grp_rank_map].rank;
+                /*Do not break if we are a group of groups.*/
+                grp = (pmix_group_t *) pmix_list_get_begin(&pmix_server_globals.groups);
+            }
+        }
+        pmix_output_verbose(5, pmix_server_globals.fence_output,
+                                    "found %s.%d", grp_nspace_map,
+                                    grp_rank_map);
+        //PMIX_LOAD_NSPACE(trk->pcs[i].nspace, grp_nspace_map);
+        //trk->pcs[i].rank = grp_rank_map;
         PMIX_LIST_FOREACH (ns, &pmix_globals.nspaces, pmix_namespace_t) {
-            if (0 == strcmp(procs[i].nspace, ns->nspace)) {
+            if (0 == strcmp(grp_nspace_map, ns->nspace)) {
                 nptr = ns;
                 break;
             }
         }
         /* check if multiple nspaces are involved in this operation */
         if (0 == strlen(first)) {
-            PMIX_LOAD_NSPACE(first, procs[i].nspace);
-        } else if (!PMIX_CHECK_NSPACE(first, procs[i].nspace)) {
+            PMIX_LOAD_NSPACE(first, grp_nspace_map);
+        } else if (!PMIX_CHECK_NSPACE(first, grp_nspace_map)) {
             trk->hybrid = true;
         }
         if (NULL == nptr) {
@@ -555,7 +578,7 @@ static pmix_server_trkr_t *new_tracker(char *id, pmix_proc_t *procs,
          * ranks. So as long as they want _all_ of them, we can
          * handle that case regardless of whether the individual
          * clients have been "registered" */
-        if (PMIX_RANK_WILDCARD == procs[i].rank) {
+        if (PMIX_RANK_WILDCARD == grp_rank_map) {
             trk->nlocal += nptr->nlocalprocs;
             /* the total number of procs in this nspace was provided
              * in the data blob delivered to register_nspace, so check
@@ -582,7 +605,7 @@ static pmix_server_trkr_t *new_tracker(char *id, pmix_proc_t *procs,
         /* is this one of my local ranks? */
         found = false;
         PMIX_LIST_FOREACH (info, &nptr->ranks, pmix_rank_info_t) {
-            if (procs[i].rank == info->pname.rank) {
+            if (grp_rank_map == info->pname.rank) {
                 pmix_output_verbose(5, pmix_server_globals.fence_output,
                                     "adding local proc %s.%d to tracker", info->pname.nspace,
                                     info->pname.rank);
@@ -730,6 +753,8 @@ static pmix_status_t _collect_data(pmix_server_trkr_t *trk, pmix_buffer_t *buf)
                 found = true;
             } else {
                 PMIX_LIST_FOREACH (nm, &trk->nslist, pmix_nspace_caddy_t) {
+                    pmix_output_verbose(5, pmix_server_globals.fence_output, "search for %s and found %s",
+                                pcs.nspace, nm->ns->nspace);
                     if (0 == strcmp(nm->ns->nspace, pcs.nspace)) {
                         found = true;
                         break;
@@ -4076,8 +4101,8 @@ static void grpcbfunc(pmix_status_t status,
 pmix_status_t pmix_server_grpconstruct(pmix_server_caddy_t *cd, pmix_buffer_t *buf)
 {
     pmix_peer_t *peer = (pmix_peer_t *) cd->peer;
-    pmix_peer_t *pr;
-    int32_t cnt, m;
+    /*pmix_peer_t *pr;*/
+    int32_t cnt/*, m*/;
     pmix_status_t rc;
     char *grpid;
     pmix_proc_t *procs;
@@ -4086,7 +4111,7 @@ pmix_status_t pmix_server_grpconstruct(pmix_server_caddy_t *cd, pmix_buffer_t *b
     size_t n, ninfo, ninf, nprocs, n2, ngrpinfo = 0;
     pmix_server_trkr_t *trk;
     bool need_cxtid = false;
-    bool match, force_local = false;
+    bool /*match,*/ force_local = false;
     bool embed_barrier = false;
     bool barrier_directive_included = false;
     bool sorted = false;
@@ -4264,16 +4289,16 @@ pmix_status_t pmix_server_grpconstruct(pmix_server_caddy_t *cd, pmix_buffer_t *b
             trk->local = true;
         } else if (need_cxtid) {
             trk->local = false;
-        } else {
+        } /*else {
             trk->local = true;
             for (n = 0; n < grp->nmbrs; n++) {
-                /* if this entry references the local procs, then
-                 * we can skip it */
+                * if this entry references the local procs, then
+                 * we can skip it *
                 if (PMIX_RANK_LOCAL_PEERS == grp->members[n].rank ||
                     PMIX_RANK_LOCAL_NODE == grp->members[n].rank) {
                     continue;
                 }
-                /* see if it references a specific local proc */
+                * see if it references a specific local proc *
                 match = false;
                 for (m = 0; m < pmix_server_globals.clients.size; m++) {
                     pr = (pmix_peer_t *) pmix_pointer_array_get_item(&pmix_server_globals.clients, m);
@@ -4286,12 +4311,12 @@ pmix_status_t pmix_server_grpconstruct(pmix_server_caddy_t *cd, pmix_buffer_t *b
                     }
                 }
                 if (!match) {
-                    /* this requires a non_local operation */
+                    * this requires a non_local operation *
                     trk->local = false;
                     break;
                 }
             }
-        }
+        }*/
     } else {
         /* cleanup */
         PMIX_INFO_FREE(info, ninfo);

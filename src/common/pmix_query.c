@@ -438,6 +438,8 @@ static void localquery(int sd, short args, void *cbdata)
             } else if (PMIX_CHECK_KEY(&queries[n].qualifiers[p], PMIX_RANK)) {
                 proc.rank = queries[n].qualifiers[p].value.data.rank;
                 rank_given = true;
+            } else if (PMIX_CHECK_KEY(&queries[n].qualifiers[p], PMIX_GROUP_ID)) {
+                PMIX_LOAD_NSPACE(proc.nspace, queries[n].qualifiers[p].value.data.string);
             }
         }
 
@@ -482,6 +484,39 @@ static void localquery(int sd, short args, void *cbdata)
                 PMIx_Value_load(kv->value, PMIX_STD_ABI_PROVISIONAL_VERSION, PMIX_STRING);
                 pmix_list_append(&cb.kvs, &kv->super);
                 rc = PMIX_SUCCESS;
+            } else if (0 == strcmp(queries[n].keys[p], PMIX_QUERY_GROUP_MEMBERSHIP) 
+                       && PMIX_PEER_IS_SERVER(pmix_globals.mypeer)) {
+                /*If we are the server and we have received a group info query*/
+                /* construct a list of values with pmix_proc_t
+                 * entries for each proc in the indicated group */
+                pmix_group_t *ps, *grp = NULL;
+                PMIX_LIST_FOREACH(ps, &pmix_server_globals.groups, pmix_group_t)
+                {
+                    if (PMIX_CHECK_NSPACE(ps->grpid, proc.nspace)) {
+                        grp = ps;
+                        break;
+                    }
+                }
+                if (NULL == grp) {
+                    goto nextstep;
+                }
+                /* Check if there are any entries in the group */
+                if (0 == grp->nmbrs) {
+                    goto nextstep;
+                }
+                /* setup the reply */
+                PMIX_KVAL_NEW(kv, cb.key);
+                pmix_list_append(&cb.kvs, &kv->super);
+                /* cycle thru the job and create an entry for each proc */
+                pmix_data_array_t *darray = NULL;
+                PMIX_DATA_ARRAY_CREATE(darray, grp->nmbrs, PMIX_PROC);
+                kv->value->type = PMIX_DATA_ARRAY;
+                kv->value->data.darray = darray;
+                pmix_proc_t *proc_array = (pmix_proc_t *) darray->array;
+                for (size_t k = 0; k < grp->nmbrs; k++) {
+                    PMIX_LOAD_PROCID(&proc_array[k], grp->members[k].nspace, grp->members[k].rank);
+                }
+                rc = PMIX_SUCCESS;       
             } else {
                 PMIX_GDS_FETCH_KV(rc, pmix_globals.mypeer, &cb);
                 if (PMIX_SUCCESS != rc) {
@@ -498,6 +533,29 @@ static void localquery(int sd, short args, void *cbdata)
             PMIX_DESTRUCT(&cb);
         }
     }
+    cd->status = PMIX_SUCCESS;
+    cd->ninfo = pmix_list_get_size(&results);
+    if (0 < cd->ninfo) {
+        PMIX_INFO_CREATE(cd->info, cd->ninfo);
+        n = 0;
+        PMIX_LIST_FOREACH_SAFE (kv, kvnxt, &results, pmix_kval_t) {
+            PMIX_LOAD_KEY(cd->info[n].key, kv->key);
+            rc = PMIx_Value_xfer(&cd->info[n].value, kv->value);
+            if (PMIX_SUCCESS != rc) {
+                cd->status = rc;
+                PMIX_INFO_FREE(cd->info, cd->ninfo);
+                break;
+            }
+            ++n;
+        }
+    }
+    /* done with the list of results */
+    PMIX_LIST_DESTRUCT(&results);
+
+    if (NULL != cd->cbfunc) {
+        cd->cbfunc(cd->status, cd->info, cd->ninfo, cd->cbdata, _local_relcb, cd);
+    }
+    return;
 
 nextstep:
     /* pass the queries thru our active plugins with query
